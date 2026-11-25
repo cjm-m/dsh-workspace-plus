@@ -308,29 +308,61 @@ function useStripFill(barRef: any, deps: any[]): number {
      */
     function rightLimitOf(header: any, bar: any, barRect: any, headerRect: any): number {
       let limit = 0
-      const nodes = Array.from(header.querySelectorAll('*')) as any[]
-      for (const node of nodes) {
-        if (bar === node) continue
-        if (typeof bar.contains === 'function' && bar.contains(node)) continue
-        if (typeof node.contains === 'function' && node.contains(bar)) continue
+      /**
+       * Left edge of a candidate control, or 0 when it cannot cap the row.
+       *
+       * Only "starts to the right of the row" is required from the geometry; how
+       * far the node's own right edge is from the header edge is deliberately NOT
+       * tested here. That distance used to be capped at 140px, which silently
+       * dropped every control that a wider plugin cluster pushed further left —
+       * the limit then fell back to the header's own padding edge and the row ran
+       * underneath those buttons.
+       */
+      const leftOf = (node: any): number => {
         const rect = node.getBoundingClientRect()
-        if (rect.width < 8 || rect.height < 8) continue
+        if (rect.width < 8 || rect.height < 8) return 0
         // Same band as the row only: the view-nav row (with the parked chips) must
         // never cap the tab row.
-        if (rect.bottom <= barRect.top + 2 || rect.top >= barRect.bottom - 2) continue
+        if (rect.bottom <= barRect.top + 2 || rect.top >= barRect.bottom - 2) return 0
         if (typeof getComputedStyle === 'function') {
           const style = getComputedStyle(node)
-          if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') continue
+          if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') return 0
         }
-        // Anchored to the header's right end (the window utilities and the parked
-        // session chips live there).
-        if (headerRect.right - rect.right > 140) continue
         // Must begin after the row: the title row starts at the row's right edge,
-        // and anything the row itself contains is already excluded above.
-        if (rect.left <= barRect.right + 4) continue
-        if (!limit || rect.left < limit) limit = rect.left
+        // so anything the row itself contains is already excluded by this test.
+        if (rect.left <= barRect.left + 8) return 0
+        return rect.left
       }
-      if (limit > 0) return limit
+      const consider = (node: any) => {
+        if (bar === node) return
+        if (typeof bar.contains === 'function' && bar.contains(node)) return
+        if (typeof node.contains === 'function' && node.contains(bar)) return
+        const left = leftOf(node)
+        if (left > 0 && (!limit || left < limit)) limit = left
+      }
+      // Preferred: the shell's own right-hand clusters, addressed by stable
+      // semantics instead of by "how close to the right edge it happens to be".
+      // The corner carries a data attribute; the utilities and the actions keep
+      // their module-scoped class names. Any plugin that widens these clusters
+      // moves their left edge, and the limit follows it.
+      const ANCHORS = [
+        '[data-conversation-header-corner]',
+        '[class*="_headerUtilities"]',
+        '[class*="_headerActions"]',
+      ]
+      for (const selector of ANCHORS) {
+        for (const node of Array.from(header.querySelectorAll(selector)) as any[]) consider(node)
+      }
+      // Fallback for a shell that stops exposing those hooks: the button-like
+      // controls parked at the header's right end.
+      if (!limit) {
+        for (const node of Array.from(header.querySelectorAll('button, [role="button"]')) as any[]) {
+          const right = node.getBoundingClientRect().right
+          if (headerRect.right - right > 320) continue
+          consider(node)
+        }
+      }
+      if (limit > 0) return Math.min(limit, headerRect.right - 12)
       // No control matched yet (cold start, or the header is still assembling):
       // stop at the header's own right padding edge, where the cluster sits.
       const padding = typeof getComputedStyle === 'function'
@@ -353,7 +385,13 @@ function useStripFill(barRef: any, deps: any[]): number {
       const headerRect = header.getBoundingClientRect()
       if (!barRect.width || !headerRect.width) return false
       const limit = rightLimitOf(header, bar, barRect, headerRect)
-      const next = stripFillWidth(limit, barRect.left, headerRect.width, 0, 100)
+      // The reserve is derived from where the right-hand cluster actually begins,
+      // so the row always stops a fixed 12px short of it. A constant reserve used
+      // to be right only for the plugin mix it was tuned on: any wider or narrower
+      // cluster silently moved the row over the buttons, or left a wide gap.
+      const gapToLimit = Math.round(headerRect.right - limit) + 12
+      const inset = Math.round(barRect.left - headerRect.left)
+      const next = stripFillWidth(limit, barRect.left, headerRect.width, 0, Math.max(40, gapToLimit + inset))
       if (next <= 0) {
         // Nothing usable this pass: hold the last good room instead of dropping
         // onto the CSS fallback, which is what leaves the row visibly short.

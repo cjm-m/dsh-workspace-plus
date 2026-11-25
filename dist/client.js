@@ -4525,23 +4525,40 @@
       }
       function rightLimitOf(header, bar, barRect, headerRect) {
         let limit = 0;
-        const nodes = Array.from(header.querySelectorAll("*"));
-        for (const node of nodes) {
-          if (bar === node) continue;
-          if (typeof bar.contains === "function" && bar.contains(node)) continue;
-          if (typeof node.contains === "function" && node.contains(bar)) continue;
+        const leftOf = (node) => {
           const rect = node.getBoundingClientRect();
-          if (rect.width < 8 || rect.height < 8) continue;
-          if (rect.bottom <= barRect.top + 2 || rect.top >= barRect.bottom - 2) continue;
+          if (rect.width < 8 || rect.height < 8) return 0;
+          if (rect.bottom <= barRect.top + 2 || rect.top >= barRect.bottom - 2) return 0;
           if (typeof getComputedStyle === "function") {
             const style = getComputedStyle(node);
-            if (style.visibility === "hidden" || style.display === "none" || style.opacity === "0") continue;
+            if (style.visibility === "hidden" || style.display === "none" || style.opacity === "0") return 0;
           }
-          if (headerRect.right - rect.right > 140) continue;
-          if (rect.left <= barRect.right + 4) continue;
-          if (!limit || rect.left < limit) limit = rect.left;
+          if (rect.left <= barRect.left + 8) return 0;
+          return rect.left;
+        };
+        const consider = (node) => {
+          if (bar === node) return;
+          if (typeof bar.contains === "function" && bar.contains(node)) return;
+          if (typeof node.contains === "function" && node.contains(bar)) return;
+          const left = leftOf(node);
+          if (left > 0 && (!limit || left < limit)) limit = left;
+        };
+        const ANCHORS = [
+          "[data-conversation-header-corner]",
+          '[class*="_headerUtilities"]',
+          '[class*="_headerActions"]'
+        ];
+        for (const selector of ANCHORS) {
+          for (const node of Array.from(header.querySelectorAll(selector))) consider(node);
         }
-        if (limit > 0) return limit;
+        if (!limit) {
+          for (const node of Array.from(header.querySelectorAll('button, [role="button"]'))) {
+            const right = node.getBoundingClientRect().right;
+            if (headerRect.right - right > 320) continue;
+            consider(node);
+          }
+        }
+        if (limit > 0) return Math.min(limit, headerRect.right - 12);
         const padding = typeof getComputedStyle === "function" ? parseFloat(getComputedStyle(header).paddingRight) || 0 : 0;
         return headerRect.right - Math.max(0, padding) - 8;
       }
@@ -4556,7 +4573,9 @@
         const headerRect = header.getBoundingClientRect();
         if (!barRect.width || !headerRect.width) return false;
         const limit = rightLimitOf(header, bar, barRect, headerRect);
-        const next = stripFillWidth(limit, barRect.left, headerRect.width, 0, 100);
+        const gapToLimit = Math.round(headerRect.right - limit) + 12;
+        const inset = Math.round(barRect.left - headerRect.left);
+        const next = stripFillWidth(limit, barRect.left, headerRect.width, 0, Math.max(40, gapToLimit + inset));
         if (next <= 0) {
           return false;
         }

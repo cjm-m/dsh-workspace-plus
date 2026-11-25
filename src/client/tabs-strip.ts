@@ -237,53 +237,152 @@ function useWheelScroll(stripRef: any) {
  */
 function useStripFill(barRef: any, deps: any[]): number {
   const [room, setRoom] = React.useState(0)
-  const measure = () => {
-    const bar = barRef.current
-    if (!bar || typeof document === 'undefined' || typeof bar.getBoundingClientRect !== 'function') return
-    const header = typeof bar.closest === 'function'
-      ? bar.closest('header[data-window-drag]')
-      : document.querySelector('header[data-window-drag]')
-    if (!header || typeof header.getBoundingClientRect !== 'function') return
-    const barRect = bar.getBoundingClientRect()
-    const headerRect = header.getBoundingClientRect()
-    if (!barRect.width || !headerRect.width) return
-    // The grid item holding the strip: its right edge is where the title row begins.
-    let gridItem: any = bar
-    while (gridItem && gridItem.parentElement && gridItem.parentElement !== header) gridItem = gridItem.parentElement
-    const leadingRight = gridItem && gridItem !== bar
-      ? gridItem.getBoundingClientRect().right
-      : barRect.right
-    let limit = 0
-    for (const node of Array.from(header.querySelectorAll('*')) as any[]) {
-      if (bar === node || (typeof bar.contains === 'function' && bar.contains(node))) continue
-      if (typeof node.contains === 'function' && node.contains(bar)) continue
-      const rect = node.getBoundingClientRect()
-      if (rect.width < 8 || rect.height < 8) continue
-      // Same band as the strip only: the view-nav row (with the parked chips) must
-      // never cap the tab row.
-      if (rect.bottom <= barRect.top + 2 || rect.top >= barRect.bottom - 2) continue
-      if (typeof getComputedStyle === 'function') {
-        const style = getComputedStyle(node)
-        if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') continue
-      }
-      // Structural scaffolding (the title row and its wrappers) is layout, not a control.
-      if (rect.left <= leadingRight + 8 && rect.right >= headerRect.right - 40) continue
-      if (headerRect.right - rect.right > 120) continue
-      if (rect.left <= barRect.left + 8) continue
-      if (!limit || rect.left < limit) limit = rect.left
+  const useIsoLayoutEffect = typeof React.useLayoutEffect === 'function' ? React.useLayoutEffect : React.useEffect
+  /** Latest requestMeasure(), so the window listener survives a re-bind. */
+  const requestMeasureRef = React.useRef(() => {})
+  useIsoLayoutEffect(() => {
+    let stopped = false
+    let timers: any[] = []
+    /** Coalescing frame for observer-driven measures. */
+    let frame = 0
+    let headerObserver: any = null
+    let observedHeader: any = null
+    let treeObserver: any = null
+    const RETRY_DELAYS = [60, 150, 320, 640, 1100, 1800]
+
+    function clearTimers() {
+      for (const timer of timers) clearTimeout(timer)
+      timers = []
     }
-    const next = stripFillWidth(limit, barRect.left, headerRect.width, 0, 100)
-    setRoom((previous: number) => (previous === next ? previous : next))
-  }
-  React.useLayoutEffect(() => {
+
+    /**
+     * Coalesce the observers into the next frame.
+     *
+     * The observers only ever fire on the header's own box and on nodes the shell
+     * mounts into it, so this frame lock is about not measuring six times for one
+     * resize, not about damping a feedback loop (see rightLimitOf for why the
+     * measurement has no loop to damp).
+     */
+    function requestMeasure() {
+      if (stopped) return
+      if (typeof requestAnimationFrame !== 'function') { measure(); return }
+      if (frame) return
+      frame = requestAnimationFrame(() => { frame = 0; measure() })
+    }
+
+    function bind(header: any) {
+      if (observedHeader === header) return
+      if (headerObserver) { headerObserver.disconnect(); headerObserver = null }
+      if (treeObserver) { treeObserver.disconnect(); treeObserver = null }
+      observedHeader = header
+      if (!header) return
+      // The header's own box changes on window resize, maximise/restore, a
+      // sidebar collapse and page zoom — the cases the deps cannot see.
+      if (typeof ResizeObserver === 'function') {
+        headerObserver = new ResizeObserver(requestMeasure)
+        headerObserver.observe(header)
+      }
+      // The header utilities are owned by the shell and mount into the header
+      // after the strip on a cold start.
+      if (typeof MutationObserver === 'function') {
+        treeObserver = new MutationObserver(requestMeasure)
+        treeObserver.observe(header, { childList: true, subtree: true })
+      }
+    }
+
+    /**
+     * Left edge of the header's right-hand cluster: the first control that
+     * STARTS to the right of the tab row, in the row's own band.
+     *
+     * The row's own right edge is deliberately only a LOWER BOUND here, never part
+     * of the comparison against a candidate. The shell lays the header out as a
+     * two-column grid (`auto | minmax(0,1fr)`), so the title row begins exactly
+     * where the tab row ends: a rule of the shape "the first node right of the row
+     * whose right edge is near the header edge" therefore matches the title row
+     * itself, the limit comes back as the row's own current right edge, and every
+     * pass adds or removes exactly what the previous pass wrote. That closed loop
+     * is what made the chips shrink step by step while the window was widened.
+     * Requiring a candidate to begin to the right of the row keeps the answer
+     * independent of how wide the row currently is, so the measurement is
+     * idempotent and needs no directional hysteresis.
+     */
+    function rightLimitOf(header: any, bar: any, barRect: any, headerRect: any): number {
+      let limit = 0
+      const nodes = Array.from(header.querySelectorAll('*')) as any[]
+      for (const node of nodes) {
+        if (bar === node) continue
+        if (typeof bar.contains === 'function' && bar.contains(node)) continue
+        if (typeof node.contains === 'function' && node.contains(bar)) continue
+        const rect = node.getBoundingClientRect()
+        if (rect.width < 8 || rect.height < 8) continue
+        // Same band as the row only: the view-nav row (with the parked chips) must
+        // never cap the tab row.
+        if (rect.bottom <= barRect.top + 2 || rect.top >= barRect.bottom - 2) continue
+        if (typeof getComputedStyle === 'function') {
+          const style = getComputedStyle(node)
+          if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') continue
+        }
+        // Anchored to the header's right end (the window utilities and the parked
+        // session chips live there).
+        if (headerRect.right - rect.right > 140) continue
+        // Must begin after the row: the title row starts at the row's right edge,
+        // and anything the row itself contains is already excluded above.
+        if (rect.left <= barRect.right + 4) continue
+        if (!limit || rect.left < limit) limit = rect.left
+      }
+      if (limit > 0) return limit
+      // No control matched yet (cold start, or the header is still assembling):
+      // stop at the header's own right padding edge, where the cluster sits.
+      const padding = typeof getComputedStyle === 'function'
+        ? parseFloat(getComputedStyle(header).paddingRight) || 0
+        : 0
+      return headerRect.right - Math.max(0, padding) - 8
+    }
+
+    /** Measure once; true when a usable room was decided this pass. */
+    function measure(): boolean {
+      if (stopped) return true
+      const bar = barRef.current
+      if (!bar || typeof document === 'undefined' || typeof bar.getBoundingClientRect !== 'function') return false
+      const header = typeof bar.closest === 'function'
+        ? bar.closest('header[data-window-drag]')
+        : document.querySelector('header[data-window-drag]')
+      if (!header || typeof header.getBoundingClientRect !== 'function') return false
+      bind(header)
+      const barRect = bar.getBoundingClientRect()
+      const headerRect = header.getBoundingClientRect()
+      if (!barRect.width || !headerRect.width) return false
+      const limit = rightLimitOf(header, bar, barRect, headerRect)
+      const next = stripFillWidth(limit, barRect.left, headerRect.width, 0, 100)
+      if (next <= 0) {
+        // Nothing usable this pass: hold the last good room instead of dropping
+        // onto the CSS fallback, which is what leaves the row visibly short.
+        return false
+      }
+      setRoom((previous: number) => (previous === next ? previous : next))
+      return true
+    }
+
+    requestMeasureRef.current = requestMeasure
     measure()
-    if (typeof setTimeout !== 'function') return undefined
-    const timers = [80, 300, 900].map((delay) => setTimeout(measure, delay))
-    return () => { for (const timer of timers) clearTimeout(timer) }
+    if (typeof setTimeout === 'function') {
+      timers = RETRY_DELAYS.map((delay) => setTimeout(() => { if (!stopped) measure() }, delay))
+    }
+    return () => {
+      stopped = true
+      clearTimers()
+      if (frame && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(frame)
+      frame = 0
+      if (headerObserver) headerObserver.disconnect()
+      if (treeObserver) treeObserver.disconnect()
+      headerObserver = null
+      treeObserver = null
+      observedHeader = null
+    }
   }, deps)
   React.useEffect(() => {
     if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return undefined
-    const onResize = () => measure()
+    const onResize = () => requestMeasureRef.current()
     window.addEventListener('resize', onResize)
     return () => window.removeEventListener('resize', onResize)
   }, [])
@@ -698,6 +797,13 @@ export function TabsStrip(props: TabsStripProps) {
   // The row is capped to the room before the window utilities; chips size to
   // their own titles and only shrink/scroll when that room runs out.
   const roomWidth = useStripFill(barRef, [tabs.length, sessionId, showTabs])
+  // The chips grow to share the row, so a cap is what keeps two open sessions
+  // from becoming two 700px slabs. It tracks the measured room: generous when a
+  // handful of chips has the row to themselves, tightening as more arrive.
+  // Count the trailing new-session chip too: it shares the row like any other.
+  const tabCap = roomWidth > 0
+    ? Math.max(150, Math.min(240, Math.round(roomWidth / Math.max(1, tabs.length + 1)) - 4))
+    : 200
   useRevealActive(stripRef, sessionId, tabs.length)
   useWheelScroll(stripRef)
   // The trigger only exists while chips are hidden; a row that suddenly fits
@@ -836,8 +942,13 @@ export function TabsStrip(props: TabsStripProps) {
     ref: barRef,
     className: 'bw-tabbar',
     'data-bw-overflow': overflow.overflowing ? '1' : '0',
-    // Measured room to the header utilities; undefined keeps the CSS fallback.
-    style: roomWidth > 0 ? { maxWidth: roomWidth + 'px' } : undefined,
+    // Measured room to the header utilities. A WIDTH, not a cap: the chips are
+    // content-sized, so a max-width only ever clips the row — the row itself has
+    // to be told how wide it is before flex-grow can spread the chips across it.
+    // Undefined keeps the CSS fallback until the first measurement lands.
+    style: roomWidth > 0
+      ? { width: roomWidth + 'px', maxWidth: roomWidth + 'px', '--bw-tab-cap': tabCap + 'px' }
+      : undefined,
   },
     StyleNode(),
     E('div', {

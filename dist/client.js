@@ -4485,22 +4485,43 @@
       let headerObserver = null;
       let observedHeader = null;
       let treeObserver = null;
+      let barObserver = null;
       const RETRY_DELAYS = [60, 150, 320, 640, 1100, 1800];
       function clearTimers() {
-        for (const timer of timers) clearTimeout(timer);
+        for (const timer of timers) {
+          if (typeof timer === "function") {
+            timer();
+            continue;
+          }
+          clearTimeout(timer);
+          if (typeof clearInterval === "function") clearInterval(timer);
+        }
         timers = [];
       }
+      let frameTimer = 0;
       function requestMeasure() {
         if (stopped) return;
         if (typeof requestAnimationFrame !== "function") {
           measure();
           return;
         }
-        if (frame) return;
+        if (frame || frameTimer) return;
         frame = requestAnimationFrame(() => {
           frame = 0;
+          if (frameTimer) {
+            clearTimeout(frameTimer);
+            frameTimer = 0;
+          }
           measure();
         });
+        if (typeof setTimeout === "function") {
+          frameTimer = setTimeout(() => {
+            frameTimer = 0;
+            if (frame && typeof cancelAnimationFrame === "function") cancelAnimationFrame(frame);
+            frame = 0;
+            measure();
+          }, 240);
+        }
       }
       function bind(header) {
         if (observedHeader === header) return;
@@ -4522,10 +4543,14 @@
           treeObserver = new MutationObserver(requestMeasure);
           treeObserver.observe(header, { childList: true, subtree: true });
         }
+        const bar = barRef.current;
+        if (bar && typeof ResizeObserver === "function") {
+          barObserver = new ResizeObserver(requestMeasure);
+          barObserver.observe(bar);
+        }
       }
       function rightLimitOf(header, bar, barRect, headerRect) {
-        let limit = 0;
-        const leftOf = (node) => {
+        const clusterWidth = (node) => {
           const rect = node.getBoundingClientRect();
           if (rect.width < 8 || rect.height < 8) return 0;
           if (rect.bottom <= barRect.top + 2 || rect.top >= barRect.bottom - 2) return 0;
@@ -4533,15 +4558,18 @@
             const style = getComputedStyle(node);
             if (style.visibility === "hidden" || style.display === "none" || style.opacity === "0") return 0;
           }
-          if (rect.left <= barRect.left + 8) return 0;
-          return rect.left;
+          return rect.width;
         };
-        const consider = (node) => {
+        let clusterLeft = 0;
+        let clusterRight = 0;
+        const measureCluster = (node) => {
           if (bar === node) return;
           if (typeof bar.contains === "function" && bar.contains(node)) return;
           if (typeof node.contains === "function" && node.contains(bar)) return;
-          const left = leftOf(node);
-          if (left > 0 && (!limit || left < limit)) limit = left;
+          if (clusterWidth(node) < 8) return;
+          const rect = node.getBoundingClientRect();
+          if (!clusterLeft || rect.left < clusterLeft) clusterLeft = rect.left;
+          if (rect.right > clusterRight) clusterRight = rect.right;
         };
         const ANCHORS = [
           "[data-conversation-header-corner]",
@@ -4549,16 +4577,17 @@
           '[class*="_headerActions"]'
         ];
         for (const selector of ANCHORS) {
-          for (const node of Array.from(header.querySelectorAll(selector))) consider(node);
+          for (const node of Array.from(header.querySelectorAll(selector))) measureCluster(node);
         }
-        if (!limit) {
-          for (const node of Array.from(header.querySelectorAll('button, [role="button"]'))) {
-            const right = node.getBoundingClientRect().right;
-            if (headerRect.right - right > 320) continue;
-            consider(node);
-          }
+        for (const node of Array.from(header.querySelectorAll('button, [role="button"]'))) {
+          const rect = node.getBoundingClientRect();
+          if (headerRect.right - rect.right > 320) continue;
+          measureCluster(node);
         }
-        if (limit > 0) return Math.min(limit, headerRect.right - 12);
+        if (clusterRight) {
+          const span = Math.round(clusterRight - clusterLeft);
+          if (span > 0) return Math.max(0, Math.round(headerRect.right - span - 12));
+        }
         const padding = typeof getComputedStyle === "function" ? parseFloat(getComputedStyle(header).paddingRight) || 0 : 0;
         return headerRect.right - Math.max(0, padding) - 8;
       }
@@ -4589,15 +4618,34 @@
           if (!stopped) measure();
         }, delay));
       }
+      if (typeof setInterval === "function") {
+        const tick = setInterval(() => {
+          if (!stopped) measure();
+        }, 1e3);
+        timers.push(tick);
+      }
+      if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+        const onVisibility = () => {
+          if (!stopped && document.visibilityState === "visible") measure();
+        };
+        document.addEventListener("visibilitychange", onVisibility);
+        timers.push(() => document.removeEventListener("visibilitychange", onVisibility));
+      }
       return () => {
         stopped = true;
         clearTimers();
+        if (frameTimer) {
+          clearTimeout(frameTimer);
+          frameTimer = 0;
+        }
         if (frame && typeof cancelAnimationFrame === "function") cancelAnimationFrame(frame);
         frame = 0;
         if (headerObserver) headerObserver.disconnect();
         if (treeObserver) treeObserver.disconnect();
+        if (barObserver) barObserver.disconnect();
         headerObserver = null;
         treeObserver = null;
+        barObserver = null;
         observedHeader = null;
       };
     }, deps);
